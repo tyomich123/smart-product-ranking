@@ -26,14 +26,22 @@ class SPR_Ranking_Engine {
         $this->tracker = SPR_Tracker::get_instance();
         $this->settings = get_option('spr_settings', array());
         
-        // Додаємо хук для оновлення релевантності
+        // Додаємо хук для оновлення релевантності (WP Cron fallback)
         add_action('spr_update_relevance', array($this, 'update_product_relevance'), 10, 2);
+        
+        // Додаємо хук для миттєвого оновлення через Action Scheduler
+        add_action('spr_update_single_product', array($this, 'update_single_product_from_action'), 10, 1);
     }
     
     /**
      * Обчислення загального скору релевантності продукту для категорії
+     * 
+     * @param int $product_id ID продукту
+     * @param int $category_id ID категорії
+     * @param bool $personalize Чи використовувати персоналізацію (за замовчуванням false для кешу)
+     * @return float Скор релевантності 0-100
      */
-    public function calculate_relevance_score($product_id, $category_id) {
+    public function calculate_relevance_score($product_id, $category_id, $personalize = false) {
         $product = wc_get_product($product_id);
         
         if (!$product) {
@@ -52,7 +60,9 @@ class SPR_Ranking_Engine {
         $sales_weight = isset($this->settings['sales_weight']) ? (float) $this->settings['sales_weight'] : 3;
         $reviews_weight = isset($this->settings['reviews_weight']) ? (float) $this->settings['reviews_weight'] : 2;
         $views_weight = isset($this->settings['views_weight']) ? (float) $this->settings['views_weight'] : 1;
+        $personalization_weight = isset($this->settings['personalization_weight']) ? (float) $this->settings['personalization_weight'] : 2;
         $enable_semantic = isset($this->settings['enable_semantic_matching']) ? $this->settings['enable_semantic_matching'] : true;
+        $enable_personalization = isset($this->settings['enable_personalization']) ? $this->settings['enable_personalization'] : true;
         
         // 1. Скор за назвою продукту
         $title_score = $this->calculate_title_score($product, $category, $enable_semantic);
@@ -69,16 +79,29 @@ class SPR_Ranking_Engine {
         // 5. Скор за переглядами
         $views_score = $this->calculate_views_score($product_id, $category_id);
         
+        // 6. Скор персоналізації (якщо увімкнено)
+        $personalization_score = 0;
+        if ($personalize && $enable_personalization) {
+            $personalization_score = $this->calculate_personalization_score($product_id, $category_id);
+        }
+        
         // Обчислення зваженого скору
         $total_score = 
             ($title_score * $title_weight) +
             ($description_score * $description_weight) +
             ($sales_score * $sales_weight) +
             ($reviews_score * $reviews_weight) +
-            ($views_score * $views_weight);
+            ($views_score * $views_weight) +
+            ($personalization_score * $personalization_weight);
         
         // Нормалізація скору
         $max_possible_score = $title_weight + $description_weight + $sales_weight + $reviews_weight + $views_weight;
+        
+        // Додаємо вагу персоналізації до максимального скору якщо вона активна
+        if ($personalize && $enable_personalization && $personalization_score > 0) {
+            $max_possible_score += $personalization_weight;
+        }
+        
         $normalized_score = $max_possible_score > 0 ? ($total_score / $max_possible_score) * 100 : 0;
         
         return round($normalized_score, 4);
@@ -228,6 +251,63 @@ class SPR_Ranking_Engine {
     }
     
     /**
+     * Скор персоналізації на основі історії переглядів користувача
+     * 
+     * @param int $product_id ID продукту
+     * @param int $category_id ID категорії
+     * @return float Скор 0-1
+     */
+    private function calculate_personalization_score($product_id, $category_id) {
+        // Перевірка чи користувач переглядав цей продукт
+        $user_views = $this->tracker->has_user_viewed_product($product_id, 30);
+        
+        if ($user_views === 0) {
+            return 0;
+        }
+        
+        // Базовий бонус за перегляд (0.5)
+        $base_bonus = 0.5;
+        
+        // Додатковий бонус залежно від кількості переглядів
+        // 1 перегляд = 0.5, 2 перегляди = 0.65, 3+ перегляди = 0.8+
+        $view_bonus = min(($user_views - 1) * 0.15, 0.3);
+        
+        // Перевірка чи продукт був переглянутий нещодавно (останні 7 днів)
+        $recent_views = $this->tracker->has_user_viewed_product($product_id, 7);
+        $recency_bonus = $recent_views > 0 ? 0.2 : 0;
+        
+        // Загальний скор персоналізації
+        $personalization_score = $base_bonus + $view_bonus + $recency_bonus;
+        
+        return min($personalization_score, 1.0);
+    }
+    
+    /**
+     * Отримання персоналізованого скору релевантності для користувача
+     * Використовується в реальному часі, не кешується
+     * 
+     * @param int $product_id ID продукту
+     * @param int $category_id ID категорії
+     * @return float Персоналізований скор релевантності 0-100
+     */
+    public function get_personalized_relevance_score($product_id, $category_id) {
+        // Отримуємо базовий скор з кешу
+        $base_score = $this->get_cached_relevance_score($product_id, $category_id);
+        
+        // Якщо персоналізація вимкнена, повертаємо базовий скор
+        $enable_personalization = isset($this->settings['enable_personalization']) ? $this->settings['enable_personalization'] : true;
+        
+        if (!$enable_personalization) {
+            return $base_score;
+        }
+        
+        // Обчислюємо персоналізований скор
+        $personalized_score = $this->calculate_relevance_score($product_id, $category_id, true);
+        
+        return $personalized_score;
+    }
+    
+    /**
      * Оновлення релевантності продукту в БД
      */
     public function update_product_relevance($product_id, $category_ids) {
@@ -238,7 +318,7 @@ class SPR_Ranking_Engine {
         foreach ($category_ids as $category_id) {
             $score = $this->calculate_relevance_score($product_id, $category_id);
             
-            // Оновлення або вставка
+            // Оновлення або вставка в таблицю
             $existing = $wpdb->get_var($wpdb->prepare(
                 "SELECT id FROM $table_name WHERE product_id = %d AND category_id = %d",
                 $product_id,
@@ -271,10 +351,30 @@ class SPR_Ranking_Engine {
                     array('%d', '%d', '%f', '%s')
                 );
             }
+            
+            // КРИТИЧНО: Зберігаємо скор в postmeta для швидкого сортування
+            $meta_key = '_spr_relevance_' . $category_id;
+            update_post_meta($product_id, $meta_key, $score);
         }
         
         // Очищення кешу
         wp_cache_delete('spr_relevance_' . $product_id);
+    }
+    
+    /**
+     * Оновлення релевантності одного продукту (для Action Scheduler)
+     * Отримує дані у вигляді масиву з Action Scheduler
+     */
+    public function update_single_product_from_action($args) {
+        if (!isset($args['product_id']) || !isset($args['category_ids'])) {
+            return;
+        }
+        
+        $product_id = intval($args['product_id']);
+        $category_ids = $args['category_ids'];
+        
+        // Викликаємо стандартний метод оновлення
+        $this->update_product_relevance($product_id, $category_ids);
     }
     
     /**

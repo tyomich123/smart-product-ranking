@@ -1,6 +1,9 @@
 <?php
 /**
- * Клас для модифікації WooCommerce запитів
+ * Модифікатор запитів для ранжування продуктів
+ * ПРАВИЛЬНИЙ підхід через WooCommerce hooks
+ *
+ * @package SmartProductRanking
  */
 
 if (!defined('ABSPATH')) {
@@ -8,9 +11,8 @@ if (!defined('ABSPATH')) {
 }
 
 class SPR_Query_Modifier {
-    
     private static $instance = null;
-    private $ranking_engine;
+    private $tracker;
     
     public static function get_instance() {
         if (null === self::$instance) {
@@ -20,78 +22,23 @@ class SPR_Query_Modifier {
     }
     
     private function __construct() {
-        $this->ranking_engine = SPR_Ranking_Engine::get_instance();
+        $this->tracker = SPR_Tracker::get_instance();
         
-        // Модифікація запитів WooCommerce
-        add_filter('woocommerce_product_query', array($this, 'modify_product_query'), 10, 2);
-        
-        // Модифікація сортування
-        add_filter('posts_clauses', array($this, 'modify_query_clauses'), 10, 2);
-        
-        // Додавання нового варіанту сортування
+        // Додавання опції сортування в dropdown
         add_filter('woocommerce_catalog_orderby', array($this, 'add_relevance_sorting'));
-        add_filter('woocommerce_get_catalog_ordering_args', array($this, 'get_relevance_sorting_args'));
         
-        // Додавання мета-даних для сортування
-        add_action('pre_get_posts', array($this, 'pre_get_posts_sorting'));
+        // Встановлення за замовчуванням
+        add_filter('woocommerce_default_catalog_orderby', array($this, 'set_default_sorting'));
+        
+        // ГОЛОВНИЙ хук - правильний WooCommerce метод для custom sorting
+        add_filter('woocommerce_get_catalog_ordering_args', array($this, 'custom_catalog_ordering'), 20, 2);
+        
+        // Модифікація основного query
+        add_action('pre_get_posts', array($this, 'modify_main_query'), 50);
     }
     
     /**
-     * Модифікація запиту продуктів
-     */
-    public function modify_product_query($q, $query) {
-        // Перевіряємо чи це запит категорії
-        if (!is_admin() && $q->is_main_query() && (is_product_category() || is_shop())) {
-            // Встановлюємо мета-запит для включення скору релевантності
-            $q->set('update_post_meta_cache', true);
-        }
-        
-        return $q;
-    }
-    
-    /**
-     * Модифікація SQL запиту для сортування за релевантністю
-     */
-    public function modify_query_clauses($clauses, $query) {
-        global $wpdb;
-        
-        // Перевіряємо чи це наш запит
-        if (!is_admin() && 
-            $query->is_main_query() && 
-            (is_product_category() || is_shop()) &&
-            isset($query->query_vars['orderby']) && 
-            $query->query_vars['orderby'] === 'relevance') {
-            
-            $category_id = 0;
-            
-            // Отримуємо ID категорії
-            if (is_product_category()) {
-                $queried_object = get_queried_object();
-                if ($queried_object) {
-                    $category_id = $queried_object->term_id;
-                }
-            }
-            
-            if ($category_id > 0) {
-                $relevance_table = $wpdb->prefix . 'spr_product_relevance';
-                
-                // Додаємо JOIN до таблиці релевантності
-                $clauses['join'] .= " LEFT JOIN {$relevance_table} AS spr ON {$wpdb->posts}.ID = spr.product_id AND spr.category_id = {$category_id}";
-                
-                // Модифікуємо ORDER BY
-                $order = isset($query->query_vars['order']) ? $query->query_vars['order'] : 'DESC';
-                $clauses['orderby'] = "COALESCE(spr.relevance_score, 0) {$order}, {$wpdb->posts}.post_date DESC";
-                
-                // Додаємо DISTINCT щоб уникнути дублікатів
-                $clauses['distinct'] = 'DISTINCT';
-            }
-        }
-        
-        return $clauses;
-    }
-    
-    /**
-     * Додавання сортування за релевантністю в WooCommerce
+     * Додавання опції "За релевантністю" в dropdown
      */
     public function add_relevance_sorting($sortby) {
         $sortby['relevance'] = __('За релевантністю', 'smart-product-ranking');
@@ -99,105 +46,145 @@ class SPR_Query_Modifier {
     }
     
     /**
-     * Аргументи для сортування за релевантністю
+     * Встановлення за замовчуванням
      */
-    public function get_relevance_sorting_args($args) {
-        if (isset($_GET['orderby']) && $_GET['orderby'] === 'relevance') {
-            $args['orderby'] = 'relevance';
+    public function set_default_sorting($default) {
+        $settings = get_option('spr_settings', array());
+        $use_as_default = isset($settings['use_as_default_sorting']) ? $settings['use_as_default_sorting'] : true;
+        
+        if ($use_as_default && (is_shop() || is_product_category() || is_product_tag())) {
+            return 'relevance';
+        }
+        
+        return $default;
+    }
+    
+    /**
+     * Модифікація основного query
+     */
+    public function modify_main_query($query) {
+        // ТІЛЬКИ для головного запиту категорій товарів
+        if (!is_admin() && 
+            $query->is_main_query() && 
+            is_product_category()) {
+            
+            // Перевіряємо налаштування
+            $settings = get_option('spr_settings', array());
+            $use_as_default = isset($settings['use_as_default_sorting']) ? $settings['use_as_default_sorting'] : true;
+            
+            if ($use_as_default) {
+                // Якщо не вказано orderby або вказано menu_order - використовуємо relevance
+                $orderby = $query->get('orderby');
+                if (empty($orderby) || $orderby == 'menu_order' || $orderby == 'menu_order title') {
+                    $query->set('orderby', 'relevance');
+                }
+            }
+        }
+    }
+    
+    /**
+     * ГОЛОВНИЙ метод - правильний WooCommerce спосіб для custom sorting
+     */
+    public function custom_catalog_ordering($args, $orderby) {
+        // Тільки для релевантності
+        if ($orderby !== 'relevance') {
+            return $args;
+        }
+        
+        // Тільки для категорій товарів
+        if (!is_product_category()) {
+            return $args;
+        }
+        
+        // Отримуємо ID категорії
+        $queried_object = get_queried_object();
+        if (!$queried_object || !isset($queried_object->term_id)) {
+            return $args;
+        }
+        
+        $category_id = $queried_object->term_id;
+        
+        // Отримуємо налаштування
+        $settings = get_option('spr_settings', array());
+        $show_unranked = isset($settings['show_unranked_products']) ? $settings['show_unranked_products'] : true;
+        
+        global $wpdb;
+        $relevance_table = $wpdb->prefix . 'spr_product_relevance';
+        
+        // Використовуємо postmeta для сортування
+        // Ключ: _spr_relevance_{category_id}
+        $meta_key = '_spr_relevance_' . $category_id;
+        
+        if ($show_unranked) {
+            // Показуємо всі товари
+            // Використовуємо meta_query щоб створити clause для сортування
+            $args['meta_query'] = array(
+                'relation' => 'OR',
+                'relevance_exists' => array(
+                    'key' => $meta_key,
+                    'compare' => 'EXISTS',
+                    'type' => 'NUMERIC'
+                ),
+                'relevance_not_exists' => array(
+                    'key' => $meta_key,
+                    'compare' => 'NOT EXISTS'
+                )
+            );
+            
+            // Сортування: спочатку з метою, потім за датою
+            $args['orderby'] = array(
+                'relevance_exists' => 'DESC',
+                'date' => 'DESC'
+            );
+            $args['meta_key'] = $meta_key;
+        } else {
+            // Тільки товари зі скором
+            $args['meta_key'] = $meta_key;
+            $args['orderby'] = 'meta_value_num';
             $args['order'] = 'DESC';
+            
+            // Додаємо meta_query щоб фільтрувати тільки товари з метою
+            $args['meta_query'] = array(
+                array(
+                    'key' => $meta_key,
+                    'compare' => 'EXISTS',
+                    'type' => 'NUMERIC'
+                )
+            );
         }
         
         return $args;
     }
     
     /**
-     * Налаштування сортування в pre_get_posts
+     * Отримання скору релевантності для продукту
      */
-    public function pre_get_posts_sorting($query) {
-        if (!is_admin() && 
-            $query->is_main_query() && 
-            (is_product_category() || is_shop())) {
-            
-            // Якщо не вказано сортування, використовуємо релевантність
-            if (!isset($_GET['orderby']) || empty($_GET['orderby'])) {
-                $query->set('orderby', 'relevance');
-                $query->set('order', 'DESC');
-            }
+    public function get_product_relevance($product_id, $category_id) {
+        // Спочатку перевіряємо postmeta
+        $meta_key = '_spr_relevance_' . $category_id;
+        $score = get_post_meta($product_id, $meta_key, true);
+        
+        if ($score !== '') {
+            return floatval($score);
         }
+        
+        // Якщо в postmeta немає - шукаємо в таблиці
+        global $wpdb;
+        $table_name = $wpdb->prefix . 'spr_product_relevance';
+        
+        $score = $wpdb->get_var($wpdb->prepare(
+            "SELECT relevance_score FROM $table_name 
+            WHERE product_id = %d AND category_id = %d",
+            $product_id,
+            $category_id
+        ));
+        
+        // Зберігаємо в postmeta для швидшого доступу
+        if ($score !== null) {
+            update_post_meta($product_id, $meta_key, floatval($score));
+            return floatval($score);
+        }
+        
+        return null;
     }
-    
-    /**
-     * Додавання скору релевантності до продукту (для використання в шаблонах)
-     */
-    public function get_product_relevance_display($product_id) {
-        $category_id = 0;
-        
-        if (is_product_category()) {
-            $queried_object = get_queried_object();
-            if ($queried_object) {
-                $category_id = $queried_object->term_id;
-            }
-        }
-        
-        if ($category_id > 0) {
-            $score = $this->ranking_engine->get_cached_relevance_score($product_id, $category_id);
-            return round($score, 2);
-        }
-        
-        return 0;
-    }
-    
-    /**
-     * Шорткод для відображення скору релевантності
-     */
-    public function relevance_score_shortcode($atts) {
-        global $product;
-        
-        if (!$product) {
-            return '';
-        }
-        
-        $atts = shortcode_atts(array(
-            'show_label' => 'yes'
-        ), $atts);
-        
-        $score = $this->get_product_relevance_display($product->get_id());
-        
-        if ($score > 0) {
-            $output = '<div class="spr-relevance-score">';
-            
-            if ($atts['show_label'] === 'yes') {
-                $output .= '<span class="spr-label">' . __('Релевантність:', 'smart-product-ranking') . ' </span>';
-            }
-            
-            $output .= '<span class="spr-score">' . $score . '%</span>';
-            $output .= '</div>';
-            
-            return $output;
-        }
-        
-        return '';
-    }
-}
-
-// Реєстрація шорткоду
-add_shortcode('product_relevance', array(SPR_Query_Modifier::get_instance(), 'relevance_score_shortcode'));
-
-/**
- * Хелпер-функція для отримання скору релевантності
- */
-function spr_get_product_relevance($product_id = null) {
-    if (!$product_id) {
-        global $product;
-        if ($product) {
-            $product_id = $product->get_id();
-        }
-    }
-    
-    if (!$product_id) {
-        return 0;
-    }
-    
-    $modifier = SPR_Query_Modifier::get_instance();
-    return $modifier->get_product_relevance_display($product_id);
 }

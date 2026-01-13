@@ -28,12 +28,33 @@ define('SPR_PLUGIN_URL', plugin_dir_url(__FILE__));
 define('SPR_PLUGIN_BASENAME', plugin_basename(__FILE__));
 
 // Перевірка наявності WooCommerce
-function spr_check_woocommerce() {
-    if (!class_exists('WooCommerce')) {
+function spr_is_woocommerce_active() {
+    if (class_exists('WooCommerce') || function_exists('WC') || defined('WC_VERSION')) {
+        return true;
+    }
+
+    if (is_admin()) {
+        include_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+        if (function_exists('is_plugin_active')) {
+            return is_plugin_active('woocommerce/woocommerce.php');
+        }
+    }
+
+    return false;
+}
+
+function spr_check_woocommerce($deactivate = false) {
+    if (!spr_is_woocommerce_active()) {
         add_action('admin_notices', 'spr_woocommerce_missing_notice');
-        deactivate_plugins(SPR_PLUGIN_BASENAME);
+
+        if ($deactivate && is_admin()) {
+            deactivate_plugins(SPR_PLUGIN_BASENAME);
+        }
+
         return false;
     }
+
     return true;
 }
 
@@ -62,11 +83,11 @@ class Smart_Product_Ranking {
         register_activation_hook(__FILE__, array($this, 'activate'));
         
         // Ініціалізація плагіна
-        add_action('plugins_loaded', array($this, 'init'));
+        add_action('plugins_loaded', array($this, 'maybe_init'), 5);
     }
     
     public function activate() {
-        if (!spr_check_woocommerce()) {
+        if (!spr_check_woocommerce(true)) {
             return;
         }
         
@@ -77,11 +98,21 @@ class Smart_Product_Ranking {
         $this->set_default_options();
     }
     
-    public function init() {
-        if (!spr_check_woocommerce()) {
+    public function maybe_init() {
+        if (!spr_is_woocommerce_active()) {
+            add_action('admin_notices', 'spr_woocommerce_missing_notice');
             return;
         }
-        
+
+        if (class_exists('WooCommerce')) {
+            $this->init();
+            return;
+        }
+
+        add_action('woocommerce_loaded', array($this, 'init'));
+    }
+
+    public function init() {
         // Завантаження файлів
         $this->load_dependencies();
         

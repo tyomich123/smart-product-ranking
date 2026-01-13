@@ -27,6 +27,8 @@ class SPR_Admin {
         
         // AJAX обробники
         add_action('wp_ajax_spr_recalculate_all', array($this, 'ajax_recalculate_all'));
+        add_action('wp_ajax_spr_get_progress', array($this, 'ajax_get_progress'));
+        add_action('wp_ajax_spr_cancel_recalculation', array($this, 'ajax_cancel_recalculation'));
         add_action('wp_ajax_spr_clear_data', array($this, 'ajax_clear_data'));
         
         // Додавання колонки релевантності в список продуктів
@@ -129,6 +131,15 @@ class SPR_Admin {
             array('field' => 'views_weight', 'default' => 1)
         );
         
+        add_settings_field(
+            'personalization_weight',
+            __('Вага персоналізації', 'smart-product-ranking'),
+            array($this, 'number_field_callback'),
+            'smart-product-ranking',
+            'spr_weights_section',
+            array('field' => 'personalization_weight', 'default' => 2)
+        );
+        
         // Секція додаткових налаштувань
         add_settings_section(
             'spr_additional_section',
@@ -144,6 +155,42 @@ class SPR_Admin {
             'smart-product-ranking',
             'spr_additional_section',
             array('field' => 'enable_semantic_matching', 'label' => __('Включити семантичне порівняння текстів', 'smart-product-ranking'))
+        );
+        
+        add_settings_field(
+            'enable_personalization',
+            __('Персоналізована видача', 'smart-product-ranking'),
+            array($this, 'checkbox_field_callback'),
+            'smart-product-ranking',
+            'spr_additional_section',
+            array('field' => 'enable_personalization', 'label' => __('Підвищувати в рейтингу товари які користувач переглядав', 'smart-product-ranking'))
+        );
+        
+        add_settings_field(
+            'enable_auto_update',
+            __('Автоматичне оновлення', 'smart-product-ranking'),
+            array($this, 'checkbox_field_callback'),
+            'smart-product-ranking',
+            'spr_additional_section',
+            array('field' => 'enable_auto_update', 'label' => __('Автоматично оновлювати релевантність при змінах продукту (коментарі, перегляди, покупки)', 'smart-product-ranking'))
+        );
+        
+        add_settings_field(
+            'show_unranked_products',
+            __('Показувати товари без скору', 'smart-product-ranking'),
+            array($this, 'checkbox_field_callback'),
+            'smart-product-ranking',
+            'spr_additional_section',
+            array('field' => 'show_unranked_products', 'label' => __('Показувати товари які ще не мають скору релевантності (нові або не оброблені)', 'smart-product-ranking'))
+        );
+        
+        add_settings_field(
+            'use_as_default_sorting',
+            __('Використовувати за замовчуванням', 'smart-product-ranking'),
+            array($this, 'checkbox_field_callback'),
+            'smart-product-ranking',
+            'spr_additional_section',
+            array('field' => 'use_as_default_sorting', 'label' => __('Автоматично сортувати товари за релевантністю (без вибору в dropdown)', 'smart-product-ranking'))
         );
         
         add_settings_field(
@@ -204,7 +251,7 @@ class SPR_Admin {
     public function sanitize_settings($input) {
         $sanitized = array();
         
-        $number_fields = array('title_weight', 'description_weight', 'sales_weight', 'reviews_weight', 'views_weight', 'cache_duration');
+        $number_fields = array('title_weight', 'description_weight', 'sales_weight', 'reviews_weight', 'views_weight', 'personalization_weight', 'cache_duration');
         
         foreach ($number_fields as $field) {
             if (isset($input[$field])) {
@@ -213,6 +260,10 @@ class SPR_Admin {
         }
         
         $sanitized['enable_semantic_matching'] = isset($input['enable_semantic_matching']) ? true : false;
+        $sanitized['enable_personalization'] = isset($input['enable_personalization']) ? true : false;
+        $sanitized['enable_auto_update'] = isset($input['enable_auto_update']) ? true : false;
+        $sanitized['show_unranked_products'] = isset($input['show_unranked_products']) ? true : false;
+        $sanitized['use_as_default_sorting'] = isset($input['use_as_default_sorting']) ? true : false;
         $sanitized['track_anonymous_users'] = isset($input['track_anonymous_users']) ? true : false;
         
         return $sanitized;
@@ -239,20 +290,64 @@ class SPR_Admin {
             <h2><?php _e('Інструменти', 'smart-product-ranking'); ?></h2>
             
             <div class="spr-tools">
-                <p>
-                    <button type="button" class="button button-primary" id="spr-recalculate-all">
-                        <?php _e('Перерахувати релевантність для всіх продуктів', 'smart-product-ranking'); ?>
-                    </button>
-                    <span class="spinner" style="float: none; margin: 0 10px;"></span>
-                    <span class="spr-message"></span>
-                </p>
+                <h3><?php _e('Перерахунок релевантності', 'smart-product-ranking'); ?></h3>
                 
-                <p class="description">
-                    <?php _e('Це оновить скор релевантності для всіх продуктів. Може зайняти деякий час.', 'smart-product-ranking'); ?>
+                <div id="spr-recalculation-controls">
+                    <p>
+                        <button type="button" class="button button-primary" id="spr-recalculate-all">
+                            <?php _e('Запустити перерахунок', 'smart-product-ranking'); ?>
+                        </button>
+                        <button type="button" class="button button-secondary" id="spr-cancel-recalculation" style="display:none;">
+                            <?php _e('Скасувати', 'smart-product-ranking'); ?>
+                        </button>
+                        <span class="spinner" style="float: none; margin: 0 10px;"></span>
+                    </p>
+                    
+                    <div id="spr-progress-container" style="display:none; margin: 20px 0;">
+                        <div class="spr-progress-info" style="margin-bottom: 10px;">
+                            <strong id="spr-progress-status"><?php _e('Готуємось...', 'smart-product-ranking'); ?></strong>
+                            <span id="spr-progress-details" style="color: #666; margin-left: 10px;"></span>
+                        </div>
+                        
+                        <div class="spr-progress-bar" style="background: #f0f0f0; border-radius: 4px; overflow: hidden; height: 30px; position: relative;">
+                            <div id="spr-progress-fill" style="background: linear-gradient(90deg, #2271b1 0%, #135e96 100%); height: 100%; width: 0%; transition: width 0.3s ease; display: flex; align-items: center; justify-content: center;">
+                                <span id="spr-progress-percent" style="color: white; font-weight: bold; position: absolute; width: 100%; text-align: center; z-index: 1;">0%</span>
+                            </div>
+                        </div>
+                        
+                        <div class="spr-progress-stats" style="margin-top: 10px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+                            <div style="background: #f9f9f9; padding: 10px; border-radius: 4px;">
+                                <strong><?php _e('Оброблено:', 'smart-product-ranking'); ?></strong>
+                                <span id="spr-processed-count">0</span> / <span id="spr-total-count">0</span>
+                            </div>
+                            <div style="background: #f9f9f9; padding: 10px; border-radius: 4px;">
+                                <strong><?php _e('Батчів:', 'smart-product-ranking'); ?></strong>
+                                <span id="spr-processed-batches">0</span> / <span id="spr-total-batches">0</span>
+                            </div>
+                            <div style="background: #f9f9f9; padding: 10px; border-radius: 4px;">
+                                <strong><?php _e('Час:', 'smart-product-ranking'); ?></strong>
+                                <span id="spr-time-elapsed">0 сек</span>
+                            </div>
+                        </div>
+                        
+                        <div id="spr-queue-info" style="margin-top: 10px; font-size: 12px; color: #666;">
+                            <span id="spr-pending-actions"></span>
+                            <span id="spr-running-actions"></span>
+                        </div>
+                    </div>
+                    
+                    <div id="spr-progress-message" style="margin-top: 10px;"></div>
+                </div>
+                
+                <p class="description" style="margin-top: 15px;">
+                    <?php _e('Процес працює у фоновому режимі через Action Scheduler. Ви можете закрити цю сторінку - перерахунок продовжиться.', 'smart-product-ranking'); ?>
+                    <br>
+                    <strong><?php _e('Для 10,000 продуктів: ~5-15 хвилин', 'smart-product-ranking'); ?></strong>
                 </p>
                 
                 <hr>
                 
+                <h3><?php _e('Очищення даних', 'smart-product-ranking'); ?></h3>
                 <p>
                     <button type="button" class="button button-secondary" id="spr-clear-data">
                         <?php _e('Очистити всі дані відстеження', 'smart-product-ranking'); ?>
@@ -391,19 +486,28 @@ class SPR_Admin {
     }
     
     /**
-     * AJAX: Перерахунок релевантності
+     * AJAX: Перерахунок релевантності (делегується до SPR_Background_Process)
      */
     public function ajax_recalculate_all() {
-        check_ajax_referer('spr-admin-nonce', 'nonce');
-        
-        if (!current_user_can('manage_woocommerce')) {
-            wp_send_json_error(array('message' => __('Недостатньо прав', 'smart-product-ranking')));
-        }
-        
-        $ranking_engine = SPR_Ranking_Engine::get_instance();
-        $ranking_engine->bulk_update_relevance();
-        
-        wp_send_json_success(array('message' => __('Релевантність успішно перераховано!', 'smart-product-ranking')));
+        // Використовуємо background process замість прямого виконання
+        $background = SPR_Background_Process::get_instance();
+        $background->ajax_start_recalculation();
+    }
+    
+    /**
+     * AJAX: Отримання прогресу
+     */
+    public function ajax_get_progress() {
+        $background = SPR_Background_Process::get_instance();
+        $background->ajax_get_progress();
+    }
+    
+    /**
+     * AJAX: Скасування перерахунку
+     */
+    public function ajax_cancel_recalculation() {
+        $background = SPR_Background_Process::get_instance();
+        $background->ajax_cancel_recalculation();
     }
     
     /**
